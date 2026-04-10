@@ -12,6 +12,22 @@ const viewUrls = new Map();
 const stageViewMapping = new Map();
 let indexPort = null;
 let inspectedTabId = null;
+let devtoolsOpenHintUntil = 0;
+let lastOpenExecuteAt = 0;
+
+function getFirstLiveKey(mapLike) {
+    if (!mapLike || mapLike.size === 0) {
+        return null;
+    }
+
+    for (const key of mapLike.keys()) {
+        if (portsByKey.get(key)) {
+            return key;
+        }
+    }
+
+    return null;
+}
 
 function safeDecode(value) {
     if (typeof value !== "string") {
@@ -27,7 +43,57 @@ function safeDecode(value) {
 
 function getMappedPort(key) {
     const mappedKey = stageViewMapping.get(key);
-    return mappedKey ? portsByKey.get(mappedKey) : null;
+    if (mappedKey) {
+        const mappedPort = portsByKey.get(mappedKey);
+        if (mappedPort) {
+            return mappedPort;
+        }
+    }
+
+    const selfPort = portsByKey.get(key);
+    const selfFrom = selfPort?._egretFrom;
+
+    if (selfFrom === "stage") {
+        const viewKey = getFirstLiveKey(viewUrls);
+        if (viewKey) {
+            bindMappedKeys(key, viewKey);
+            return portsByKey.get(viewKey) || null;
+        }
+    }
+
+    if (selfFrom === "view") {
+        const stageKey = getFirstLiveKey(stageUrls);
+        if (stageKey) {
+            bindMappedKeys(stageKey, key);
+            return portsByKey.get(stageKey) || null;
+        }
+    }
+
+    return null;
+}
+
+function unmapKey(key) {
+    if (!key) {
+        return;
+    }
+
+    const peerKey = stageViewMapping.get(key);
+    stageViewMapping.delete(key);
+
+    if (peerKey && stageViewMapping.get(peerKey) === key) {
+        stageViewMapping.delete(peerKey);
+    }
+}
+
+function bindMappedKeys(stageKey, viewKey) {
+    if (!stageKey || !viewKey || stageKey === viewKey) {
+        return;
+    }
+
+    unmapKey(stageKey);
+    unmapKey(viewKey);
+    stageViewMapping.set(stageKey, viewKey);
+    stageViewMapping.set(viewKey, stageKey);
 }
 
 function updateStageList() {
@@ -70,27 +136,45 @@ function saveConnection(message, port) {
     }
 
     if (targetKey) {
-        stageViewMapping.set(targetKey, key);
-        stageViewMapping.set(key, targetKey);
+        bindMappedKeys(targetKey, key);
+    } else if (from === "stage") {
+        const viewKey = getFirstLiveKey(viewUrls);
+        if (viewKey) {
+            bindMappedKeys(key, viewKey);
+        }
+    } else if (from === "view") {
+        const stageKey = getFirstLiveKey(stageUrls);
+        if (stageKey) {
+            bindMappedKeys(stageKey, key);
+        }
     }
 
     updateStageList();
 }
 
-function clearConnection(key) {
+function clearConnection(key, options = {}) {
     if (!key) {
         return;
     }
 
+    const keepPeerMappingIfPeerAlive = options.keepPeerMappingIfPeerAlive === true;
     const mappedKey = stageViewMapping.get(key);
 
     portsByKey.delete(key);
     stageUrls.delete(key);
     viewUrls.delete(key);
-    stageViewMapping.delete(key);
 
-    if (mappedKey) {
-        stageViewMapping.delete(mappedKey);
+    if (!mappedKey) {
+        unmapKey(key);
+    } else {
+        const mappedPort = portsByKey.get(mappedKey);
+        if (keepPeerMappingIfPeerAlive && mappedPort) {
+            stageViewMapping.set(key, mappedKey);
+            stageViewMapping.set(mappedKey, key);
+        } else {
+            unmapKey(key);
+            unmapKey(mappedKey);
+        }
     }
 
     updateStageList();
@@ -124,11 +208,25 @@ function handleDevtoolsBridgeMessage(message) {
     if (typeof message?.tabId === "number") {
         inspectedTabId = message.tabId;
     }
+
+    if (message?.devToolHidden === true) {
+        devtoolsOpenHintUntil = 0;
+    } else if (message?.devToolHidden === false) {
+        devtoolsOpenHintUntil = Date.now() + 5000;
+    }
 }
 
 function handleIsDevToolOpen(message, port, key) {
     const mappedKey = stageViewMapping.get(key);
-    const isOpen = Boolean(mappedKey && portsByKey.get(mappedKey));
+    let isOpen = Boolean(mappedKey && portsByKey.get(mappedKey));
+
+    if (!isOpen) {
+        isOpen = Boolean(getFirstLiveKey(viewUrls));
+    }
+
+    if (!isOpen && Date.now() < devtoolsOpenHintUntil) {
+        isOpen = true;
+    }
 
     port.postMessage({
         id: message.id,
@@ -142,11 +240,35 @@ function handleOpenMessage(message) {
         return;
     }
 
+    // Once stage is connected, ignore repeated open heartbeats from devtools.
+    if (getFirstLiveKey(stageUrls)) {
+        return;
+    }
+
+    const now = Date.now();
+    if (now - lastOpenExecuteAt < 500) {
+        return;
+    }
+    lastOpenExecuteAt = now;
+
+    devtoolsOpenHintUntil = Date.now() + 5000;
+
     chrome.scripting.executeScript({
         target: { tabId: inspectedTabId },
         func: () => {
+            try {
+                window.postMessage({
+                    from: "egret-inspector-content",
+                    type: "start-inspect"
+                }, "*");
+            } catch (error) {
+            }
+
             if (typeof window.startListen === "function") {
-                window.startListen();
+                try {
+                    window.startListen();
+                } catch (error) {
+                }
             }
         }
     }).catch(() => {
@@ -200,7 +322,10 @@ chrome.runtime.onConnect.addListener((port) => {
         }
 
         const key = port._egretKey || safeDecode(port.name);
+        const from = port._egretFrom;
         notifyPeerDisconnected(key);
-        clearConnection(key);
+        clearConnection(key, {
+            keepPeerMappingIfPeerAlive: from === "stage"
+        });
     });
 });
